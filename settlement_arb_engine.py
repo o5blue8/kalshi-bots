@@ -1,48 +1,58 @@
-import os
-import re
-import base64
-import time
-import requests
-import json
 import asyncio
 import websockets
-import logging
-from datetime import datetime
+import json
+import re
+import time
+import os
+import sys
+import base64
+import requests
+from datetime import datetime, timezone
+from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
-from cryptography.hazmat.backends import default_backend
+
+# Windows console emoji-safety (see flipper_variant_a.py).
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 # --- CONFIGURATION ---
-KEY_ID_FILE = "key_id.txt"
-PEM_FILE = "kalshi_key.pem"
-LOG_FILE = "settlement_audit.log"
-BASE_URL = "https://api.elections.kalshi.com/trade-api/v2"
 KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
+KALSHI_REST_URL = "https://api.elections.kalshi.com/trade-api/v2"
 
-# --- TRADING GUARDRAILS ---
-DRY_RUN = True              # True = Paper Trading | False = Live Execution
-MAX_POSITION_SIZE = 1       # Contracts per trade
-MAX_BUY_PRICE_CENTS = 85    # Buy winning contract ONLY if priced <= 85¢ (Min 15¢ edge)
+# --- MEASUREMENT PARAMETERS ---
+# This engine NEVER trades. It records, at fixed checkpoints before each 15-min
+# settlement, what the near-certain winner is and what price it is buyable at,
+# plus the official post-settlement result. A few days of this tells us whether
+# the "buy the near-decided winner at a discount" convergence edge is real
+# before we commit to building a trading bot around it.
+# Cover the full late-window convergence curve, not just the final minute. The
+# first live window showed the winner already fully priced (~99c) by T-90s, but
+# only ~73c at T-350s while already a strong favorite -- so any real edge lives
+# in the 3-6 min pre-close zone, and the measurement has to reach out that far.
+CHECKPOINTS_SEC = [300, 240, 180, 120, 90, 60, 30, 15]  # seconds-before-close to log an observation
+CONFIDENCE_MARGIN = 10.0   # |avg_60s - strike| >= this (USD) => "high confidence" winner
+MAX_BUY_PRICE_CENTS = 85   # a winner buyable <= this is tagged as an actionable edge
+MIN_AVG_WINDOW = 45        # trust avg_60s only once its rolling buffer has >= this many samples
+STATUS_UPDATE_INTERVAL = 20
 
-file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
-file_handler.setLevel(logging.INFO)
-file_handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+load_dotenv()
+KALSHI_API_KEY_ID = os.getenv("KALSHI_API_KEY_ID")
+KALSHI_PRIVATE_KEY_PATH = os.getenv("KALSHI_PRIVATE_KEY_PATH")
 
-logger = logging.getLogger("SettlementEngine")
-logger.setLevel(logging.INFO)
-logger.addHandler(file_handler)
-
-def log_to_audit(msg):
-    logger.info(msg)
-    file_handler.flush()
+def load_private_key(file_path):
+    with open(file_path, "rb") as key_file:
+        return serialization.load_pem_private_key(key_file.read(), password=None)
 
 def extract_strike_price(market_obj):
     strike = market_obj.get("floor_strike") or market_obj.get("cap_strike")
     if strike and float(strike) > 0:
         return float(strike)
-    
-    text_to_search = f"{market_obj.get('title', '')} {market_obj.get('subtitle', '')}"
-    matches = re.findall(r"\$?([0-9]{2,3},?[0-9]{3}\.?[0-9]*)", text_to_search)
+    text = f"{market_obj.get('title', '')} {market_obj.get('subtitle', '')}"
+    matches = re.findall(r"\$?([0-9]{2,3},?[0-9]{3}\.?[0-9]*)", text)
     if matches:
         try:
             return float(matches[0].replace(",", ""))
@@ -50,233 +60,175 @@ def extract_strike_price(market_obj):
             pass
     return 0.0
 
-def get_actual_window_start_time():
-    now = time.time()
-    return now - (now % 900)
-
-class KalshiEngine:
+class SettlementMonitor:
     def __init__(self):
-        self.key_id = None
-        self.private_key = None
-        self.load_credentials()
+        self.bot_name = "SETTLEMENT MONITOR"
+        self.private_key = load_private_key(KALSHI_PRIVATE_KEY_PATH)
+        self.current_window_id = ""
+        self.close_timestamp = 0.0
+        self.strike = 0.0
+        self.current_brti = 0.0
+        self.avg_60s = 0.0
+        self.avg_window_size = 0
+        self.logged_checkpoints = set()
+        self.last_status_time = 0.0
 
-    def load_credentials(self):
-        if not os.path.exists(KEY_ID_FILE) or not os.path.exists(PEM_FILE):
-            raise FileNotFoundError("Missing key_id.txt or kalshi_key.pem in this folder.")
+    def write_audit_log(self, message):
+        ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+        with open(f"{self.bot_name.replace(' ', '_')}_audit.log", "a", encoding="utf-8") as f:
+            f.write(f"[{ts}] {message}\n")
 
-        with open(KEY_ID_FILE, "r") as f:
-            self.key_id = f.read().strip()
-
-        with open(PEM_FILE, "rb") as key_file:
-            self.private_key = serialization.load_pem_private_key(
-                key_file.read(),
-                password=None,
-                backend=default_backend()
-            )
-
-    def sign_request(self, timestamp_ms, method, path):
-        path_clean = path.split('?')[0]
-        message = f"{timestamp_ms}{method}{path_clean}".encode('utf-8')
-        signature = self.private_key.sign(
-            message,
-            padding.PSS(
-                mgf=padding.MGF1(hashes.SHA256()),
-                salt_length=padding.PSS.DIGEST_LENGTH
-            ),
-            hashes.SHA256()
-        )
-        return base64.b64encode(signature).decode('utf-8')
-
-    def get_headers(self, method, path):
-        timestamp_ms = str(int(time.time() * 1000))
-        sig = self.sign_request(timestamp_ms, method, path)
+    def sign(self, method, path):
+        ts = str(int(time.time() * 1000))
+        msg = f"{ts}{method}{path.split('?')[0]}".encode("utf-8")
+        sig = self.private_key.sign(
+            msg, padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH), hashes.SHA256())
         return {
-            "KALSHI-ACCESS-KEY": self.key_id,
-            "KALSHI-ACCESS-SIGNATURE": sig,
-            "KALSHI-ACCESS-TIMESTAMP": timestamp_ms,
-            "Content-Type": "application/json"
+            "KALSHI-ACCESS-KEY": KALSHI_API_KEY_ID,
+            "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode("utf-8"),
+            "KALSHI-ACCESS-TIMESTAMP": ts,
         }
 
-    def get_ws_headers(self):
-        return self.get_headers("GET", "/trade-api/ws/v2")
-
-    def get_balance(self):
-        path = "/trade-api/v2/portfolio/balance"
-        headers = self.get_headers("GET", path)
-        res = requests.get(f"{BASE_URL}/portfolio/balance", headers=headers)
-        if res.status_code == 200:
-            return res.json().get("balance", 0) / 100.0
-        return None
-
-    def get_15m_btc_markets(self):
-        path = "/trade-api/v2/markets?limit=10&status=open&series_ticker=KXBTC15M"
-        headers = self.get_headers("GET", path)
-        res = requests.get(f"{BASE_URL}/markets?limit=10&status=open&series_ticker=KXBTC15M", headers=headers)
-        if res.status_code == 200:
-            return res.json().get("markets", [])
-        return []
-
-    def get_market_orderbook(self, ticker):
-        path = f"/trade-api/v2/markets/{ticker}/orderbook"
-        headers = self.get_headers("GET", path)
-        res = requests.get(f"{BASE_URL}/markets/{ticker}/orderbook", headers=headers)
-        
-        if res.status_code == 200:
-            data = res.json()
-            ob = data.get("orderbook_fp", data.get("orderbook", {}))
-            
-            yes_list = ob.get("yes_dollars") or ob.get("yes") or []
-            no_list = ob.get("no_dollars") or ob.get("no") or []
-            
-            best_yes_bid = float(yes_list[-1][0]) if yes_list else 0.0
-            best_no_bid = float(no_list[-1][0]) if no_list else 0.0
-            
-            # Robust ask derivation
-            best_yes_ask = (1.0 - best_no_bid) if best_no_bid > 0 else (float(yes_list[0][0]) if yes_list else 0.0)
-            best_no_ask = (1.0 - best_yes_bid) if best_yes_bid > 0 else (float(no_list[0][0]) if no_list else 0.0)
-            
-            return {
-                "yes_ask_cents": int(round(best_yes_ask * 100)),
-                "no_ask_cents": int(round(best_no_ask * 100))
-            }
-        return None
-
-async def run_live_monitor():
-    print("=" * 65)
-    print("SETTLEMENT ARBITRAGE AUDIT ENGINE")
-    print(f"Logging Directly To: {LOG_FILE}")
-    print("=" * 65)
-    
-    log_to_audit(f"ENGINE STARTED | Mode: {'DRY RUN' if DRY_RUN else 'LIVE'} | Max Buy Limit: {MAX_BUY_PRICE_CENTS}c")
-
-    engine = KalshiEngine()
-    balance = engine.get_balance()
-    print(f"Balance Verified: ${balance:,.2f}\n")
-
-    current_ticker = None
-
-    while True:
-        markets = engine.get_15m_btc_markets()
-        if not markets:
-            print("No open 15M markets found. Retrying in 10s...")
-            await asyncio.sleep(10)
-            continue
-
-        markets.sort(key=lambda x: x.get("close_time", ""))
-        target_market = markets[0]
-        ticker = target_market.get("ticker")
-        close_time = target_market.get("close_time")
-        strike_price = extract_strike_price(target_market)
-
-        if ticker != current_ticker:
-            current_ticker = ticker
-            log_msg = f"MONITORING WINDOW: [{ticker}] | Strike: ${strike_price:,.2f} | Closes: {close_time}"
-            print(f"\n{log_msg}")
-            log_to_audit(log_msg)
-
-        ws_headers = engine.get_ws_headers()
-
+    def get_live_market(self):
+        """Returns (ticker, close_timestamp, strike) for the open KXBTC15M market closing soonest."""
+        headers = self.sign("GET", "/trade-api/v2/markets")
         try:
-            async with websockets.connect(KALSHI_WS_URL, additional_headers=ws_headers) as ws:
-                subscribe_msg = {
-                    "id": 1,
-                    "cmd": "subscribe",
-                    "params": {"channels": ["cfbenchmarks_value"], "index_ids": ["all"]}
-                }
-                await ws.send(json.dumps(subscribe_msg))
-                
-                last_ob_check = 0
-                ob_data = {"yes_ask_cents": 0, "no_ask_cents": 0}
+            res = requests.get(f"{KALSHI_REST_URL}/markets?limit=5&status=open&series_ticker=KXBTC15M",
+                               headers=headers, timeout=10)
+            if res.status_code != 200:
+                return None
+            markets = res.json().get("markets", [])
+            if not markets:
+                return None
+            markets.sort(key=lambda m: m.get("close_time", ""))
+            m = markets[0]
+            close_dt = datetime.strptime(m["close_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            return m["ticker"], close_dt.timestamp(), extract_strike_price(m)
+        except (requests.RequestException, KeyError, ValueError):
+            return None
 
-                async for msg in ws:
-                    data = json.loads(msg)
-                    if data.get("type") == "cfbenchmarks_value":
-                        body = data.get("msg", {})
-                        index_id = body.get("index_id") or data.get("index_id")
-                        if not index_id and "data" in body:
-                            try:
-                                inner_data = json.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
-                                index_id = inner_data.get("id")
-                            except Exception:
-                                pass
+    def get_official_result(self, ticker):
+        """Post-close: read the settled market's result ('yes'/'no'/'')."""
+        headers = self.sign("GET", f"/trade-api/v2/markets/{ticker}")
+        try:
+            res = requests.get(f"{KALSHI_REST_URL}/markets/{ticker}", headers=headers, timeout=10)
+            if res.status_code == 200:
+                return res.json().get("market", {}).get("result", "")
+        except requests.RequestException:
+            pass
+        return ""
 
-                        if index_id != "BRTI":
+    async def run(self):
+        startup = f"ENGINE STARTED [{self.bot_name}] | MEASUREMENT ONLY (never trades) | checkpoints {CHECKPOINTS_SEC}s pre-close"
+        print(f"[INFO] {startup}")
+        self.write_audit_log(startup)
+
+        while True:
+            try:
+                live = await asyncio.to_thread(self.get_live_market)
+                if not live:
+                    await asyncio.sleep(2)
+                    continue
+                target_ticker, close_ts, strike = live
+                if time.time() >= close_ts:  # already closed listing lag
+                    await asyncio.sleep(2)
+                    continue
+
+                if target_ticker != self.current_window_id:
+                    self.current_window_id = target_ticker
+                    self.close_timestamp = close_ts
+                    self.strike = strike
+                    self.logged_checkpoints = set()
+                    self.avg_window_size = 0
+
+                ws_headers = self.sign("GET", "/trade-api/ws/v2")
+                async with websockets.connect(KALSHI_WS_URL, ping_interval=None, additional_headers=ws_headers) as ws:
+                    print(f"[INFO] Locked window {target_ticker} | strike ${strike:,.2f} | closes in {int(close_ts - time.time())}s")
+                    await ws.send(json.dumps({"id": 1, "cmd": "subscribe",
+                        "params": {"channels": ["ticker"], "market_tickers": [target_ticker]}}))
+                    await ws.send(json.dumps({"id": 2, "cmd": "subscribe",
+                        "params": {"channels": ["cfbenchmarks_value"], "index_ids": ["BRTI"]}}))
+
+                    yes_bid = yes_ask = no_bid = no_ask = 0
+                    yes_bid_size = yes_ask_size = 0.0
+
+                    async for message in ws:
+                        data = json.loads(message)
+                        mtype = data.get("type", "")
+                        if mtype == "ping" or message == "heartbeat":
+                            await ws.send("pong")
                             continue
 
-                        brti_raw = body.get("value")
-                        if brti_raw is None and "data" in body:
+                        if mtype == "cfbenchmarks_value":
                             try:
-                                inner_data = json.loads(body["data"]) if isinstance(body["data"], str) else body["data"]
-                                brti_raw = inner_data.get("value")
-                            except Exception:
+                                m = data.get("msg", {})
+                                self.current_brti = float(json.loads(m.get("data", "{}")).get("value", 0.0))
+                                avg = m.get("avg_60s_data", {})
+                                if avg:
+                                    self.avg_60s = float(avg.get("value", 0.0))
+                                    self.avg_window_size = int(avg.get("window_size", 0))
+                            except (json.JSONDecodeError, ValueError, TypeError):
                                 pass
-                        brti = float(brti_raw) if brti_raw is not None else None
 
-                        avg_obj = body.get("last_60s_windowed_average_15min", {})
-                        avg_val = avg_obj.get("value") if isinstance(avg_obj, dict) else None
-                        avg_60s = float(avg_val) if avg_val is not None else None
+                        elif mtype == "ticker":
+                            m = data.get("msg", {})
+                            if m.get("market_ticker", "") != self.current_window_id:
+                                continue
+                            yes_bid = int(float(m.get("yes_bid_dollars", "0.0")) * 100)
+                            yes_ask = int(float(m.get("yes_ask_dollars", "0.0")) * 100)
+                            no_bid = 100 - yes_ask if yes_ask > 0 else 0
+                            no_ask = 100 - yes_bid if yes_bid > 0 else 100
+                            yes_bid_size = float(m.get("yes_bid_size_fp", "0") or 0)
+                            yes_ask_size = float(m.get("yes_ask_size_fp", "0") or 0)
 
-                        now_time = time.time()
-                        if now_time - last_ob_check > 2.0:
-                            fetched_ob = engine.get_market_orderbook(ticker)
-                            if fetched_ob:
-                                ob_data = fetched_ob
-                            last_ob_check = now_time
+                        ttc = self.close_timestamp - time.time()
 
-                        # EVALUATE ONCE AT SETTLEMENT
-                        if avg_60s:
-                            yes_ask = ob_data['yes_ask_cents']
-                            no_ask = ob_data['no_ask_cents']
+                        if time.time() - self.last_status_time >= STATUS_UPDATE_INTERVAL and ttc > 0:
+                            margin = self.avg_60s - self.strike if self.avg_60s else 0.0
+                            print(f"[STATUS] {self.current_window_id} | close in {int(ttc)}s | "
+                                  f"avg60 ${self.avg_60s:,.2f} (n={self.avg_window_size}) | strike ${self.strike:,.2f} | "
+                                  f"margin ${margin:+.2f} | Y_ask {yes_ask}c N_ask {no_ask}c")
+                            self.last_status_time = time.time()
 
-                            winning_side = "YES" if (strike_price == 0 or avg_60s > strike_price) else "NO"
-                            winning_ask = yes_ask if winning_side == "YES" else no_ask
+                        # --- record an observation as we cross each checkpoint ---
+                        for cp in CHECKPOINTS_SEC:
+                            if cp not in self.logged_checkpoints and ttc <= cp and self.avg_60s > 0:
+                                self.logged_checkpoints.add(cp)
+                                margin = self.avg_60s - self.strike
+                                winner = "YES" if margin > 0 else "NO"
+                                winner_ask = yes_ask if winner == "YES" else no_ask
+                                # Depth available to BUY the winner: take the YES ask for a
+                                # YES winner, or cross the YES bid (= the synthetic NO ask)
+                                # for a NO winner. Tells us whether the buyable price has real
+                                # size behind it or is a 1-lot phantom quote -- the one thing
+                                # that decides if this edge is deployable.
+                                winner_depth = yes_ask_size if winner == "YES" else yes_bid_size
+                                conf = "HI" if abs(margin) >= CONFIDENCE_MARGIN else "LO"
+                                buyable = "Y" if (0 < winner_ask <= MAX_BUY_PRICE_CENTS) else "N"
+                                rec = (f"SETTLE-OBS | {self.current_window_id} | T-{cp}s | "
+                                       f"avg={self.avg_60s:.2f} | strike={self.strike:.2f} | margin={margin:+.2f} | "
+                                       f"winner={winner} | winner_ask={winner_ask}c | ask_depth={winner_depth:.0f} | "
+                                       f"conf={conf} | buyable={buyable} | wsize={self.avg_window_size}")
+                                print(f"[OBS] {rec}")
+                                self.write_audit_log(rec)
 
-                            if winning_ask > 0 and winning_ask <= MAX_BUY_PRICE_CENTS:
-                                action = f"[SIMULATED BUY {winning_side} @ {winning_ask}c]" if DRY_RUN else f"[EXECUTED BUY {winning_side} @ {winning_ask}c]"
-                                reason = f"{winning_side} won (60s Avg ${avg_60s:,.2f} vs Strike ${strike_price:,.2f}) & Ask {winning_ask}c <= {MAX_BUY_PRICE_CENTS}c limit."
-                            else:
-                                action = "[NO TRADE - NO EDGE]"
-                                reason = f"{winning_side} won (60s Avg ${avg_60s:,.2f} vs Strike ${strike_price:,.2f}), but Ask ({winning_ask}c) exceeded limit ({MAX_BUY_PRICE_CENTS}c)."
-
-                            audit_record = (
-                                f"\n==================== 15-MIN WINDOW AUDIT ====================\n"
-                                f"Contract Ticker : {ticker}\n"
-                                f"Strike Baseline : ${strike_price:,.2f}\n"
-                                f"Final 60s Avg   : ${avg_60s:,.2f}\n"
-                                f"Order Book Asks : YES: {yes_ask}c | NO: {no_ask}c\n"
-                                f"Action Taken    : {action}\n"
-                                f"Reason          : {reason}\n"
-                                f"============================================================="
-                            )
-                            log_to_audit(audit_record)
-                            print(f"\n{audit_record}\n")
-                            
-                            # SLEEP UNTIL NEXT WINDOW STARTS TO PREVENT REPEATED LOGS
-                            window_start = get_actual_window_start_time()
-                            remaining_secs = max(1, int(900 - (time.time() - window_start)) + 2)
-                            print(f"⏳ Settlement Audited. Sleeping {remaining_secs}s for next window...")
-                            await asyncio.sleep(remaining_secs)
+                        # --- window closed: capture de-facto + official result, then roll ---
+                        if ttc <= 0:
+                            defacto = "YES" if (self.avg_60s - self.strike) > 0 else "NO"
+                            await asyncio.sleep(8)  # let settlement post to REST before reading result
+                            official = await asyncio.to_thread(self.get_official_result, self.current_window_id)
+                            rec = (f"SETTLE-RESULT | {self.current_window_id} | final_avg={self.avg_60s:.2f} | "
+                                   f"strike={self.strike:.2f} | defacto={defacto} | official={official or 'pending'} | "
+                                   f"last_Y_ask={yes_ask}c last_N_ask={no_ask}c")
+                            print(f"[RESULT] {rec}")
+                            self.write_audit_log(rec)
                             break
 
-                        ts = datetime.now().strftime("%H:%M:%S")
-                        brti_str = f"${brti:,.2f}" if brti else "Connecting..."
-                        avg_str = f"${avg_60s:,.2f}" if avg_60s else "Inactive (Settles MM:14-15)"
-                        
-                        print(
-                            f"[{ts}] BTC: {brti_str} | 60s Avg: {avg_str} | "
-                            f"YES Ask: {ob_data['yes_ask_cents']}c | NO Ask: {ob_data['no_ask_cents']}c      ",
-                            end="\r"
-                        )
-
-        except Exception as e:
-            err_msg = f"Window Exception: {e}. Reconnecting in 5s..."
-            print(f"\n{err_msg}")
-            log_to_audit(err_msg)
-
-        await asyncio.sleep(2)
+            except Exception as e:
+                err = f"Exception: {e}. Reconnecting in 5s..."
+                print(f"[ERROR] {err}")
+                self.write_audit_log(f"ERROR: {err}")
+                await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_live_monitor())
-    except KeyboardInterrupt:
-        print("\n\nEngine stopped.")
+    asyncio.run(SettlementMonitor().run())

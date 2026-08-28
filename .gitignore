@@ -1,4 +1,5 @@
 ﻿kalshi_key.pem
 key_id.txt
+.env
 *.log
 __pycache__/

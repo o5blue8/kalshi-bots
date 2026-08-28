@@ -1,22 +1,21 @@
 import asyncio
 import websockets
 import json
+import re
 import time
 import os
 import sys
 import base64
 import requests
+from collections import deque
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 
-# Windows consoles often default to a codepage (e.g. cp1252) that can't encode
-# the emoji used in status/log messages. Without this, print() raises
-# UnicodeEncodeError mid-message -- which aborts the whole ws connection
-# (since it happens inside the try/except in run()) before write_audit_log()
-# ever runs, silently discarding whatever was being reported, trade fills
-# included.
+# See flipper_variant_a.py for why this is needed: emoji in status/log
+# messages raise UnicodeEncodeError under this console's default codepage,
+# which aborts the connection before write_audit_log() runs.
 for _stream in (sys.stdout, sys.stderr):
     try:
         _stream.reconfigure(encoding="utf-8", errors="replace")
@@ -27,16 +26,27 @@ for _stream in (sys.stdout, sys.stderr):
 KALSHI_WS_URL = "wss://api.elections.kalshi.com/trade-api/ws/v2"
 KALSHI_REST_URL = "https://api.elections.kalshi.com/trade-api/v2"
 RECONNECT_COOLDOWN_SECONDS = 30
-HOLD_EXPIRATION_SECONDS = 60
 
-# --- BOT A STRATEGY PARAMETERS ---
-MOVE_THRESHOLD = 12.00
-MIN_ASK_CENTS = 44
-MAX_ASK_CENTS = 56
-PROFIT_TARGET_CENTS = 15
-STOP_LOSS_CENTS = 12
-ENTRY_PHASE_SECONDS = 180  # First 3 minutes of the 15m window
-MAX_TRADES_PER_WINDOW = 4  # Re-arms after each close instead of sitting out the rest of the window
+# --- BOT D STRATEGY PARAMETERS ---
+# Unlike A/B/C (single-timeframe trigger, tight scalp exits), Bot D requires
+# a shorter AND a longer lookback to agree on direction before entering --
+# a single-tick spike that reverses in 10-30s (the US/London-open fakeout
+# pattern that hurt A/B/C) won't clear the 180s bar even if it clears the 60s
+# one. In exchange for being more selective, it rides a confirmed move
+# further: wider target/stop, one trade per window, no short fixed hold --
+# it exits on target, stop, or the hard pre-settlement cutoff, whichever
+# comes first.
+MIN_ASK_CENTS = 40
+MAX_ASK_CENTS = 60
+PROFIT_TARGET_CENTS = 30
+STOP_LOSS_CENTS = 18
+MOVE_THRESHOLD_60S = 20.0
+MOVE_THRESHOLD_180S = 35.0
+CONFIRMATION_LOOKBACK_SECONDS = 180
+ENTRY_CUTOFF_SECONDS = 660   # No new entries after 11 minutes into the window
+FORCE_EXIT_SECONDS = 840     # Any open position is force-closed by 14 minutes in,
+                             # regardless of P/L -- never rides into settlement.
+MAX_TRADES_PER_WINDOW = 1    # Patient/selective: one confirmed swing per window
 STATUS_UPDATE_INTERVAL = 15
 
 load_dotenv()
@@ -50,9 +60,29 @@ def load_private_key(file_path):
             password=None
         )
 
-class BotA:
+def extract_strike_price(market_obj):
+    """
+    Kalshi's KXBTC15M markets occasionally list without a strike attached yet
+    (observed historically as "Strike: $0.00" in the audit log) -- the
+    is_trading_allowed() zero-strike guard exists specifically to refuse
+    trading against those.
+    """
+    strike = market_obj.get("floor_strike") or market_obj.get("cap_strike")
+    if strike and float(strike) > 0:
+        return float(strike)
+
+    text_to_search = f"{market_obj.get('title', '')} {market_obj.get('subtitle', '')}"
+    matches = re.findall(r"\$?([0-9]{2,3},?[0-9]{3}\.?[0-9]*)", text_to_search)
+    if matches:
+        try:
+            return float(matches[0].replace(",", ""))
+        except ValueError:
+            pass
+    return 0.0
+
+class BotD:
     def __init__(self):
-        self.bot_name = "BOT A - BASELINE"
+        self.bot_name = "BOT D - SWING CONFIRMATION"
         self.last_reconnect_time = 0.0
 
         # Position Management
@@ -63,9 +93,10 @@ class BotA:
         self.private_key = load_private_key(KALSHI_PRIVATE_KEY_PATH)
         self.current_window_id = ""
         self.window_start_timestamp = 0.0
+        self.current_strike = 0.0
         self.trade_count = 0
-        self.brti_anchor_price = 0.0
         self.current_brti = 0.0
+        self.price_history = deque()  # (timestamp, brti) samples, pruned to CONFIRMATION_LOOKBACK_SECONDS
 
         self.last_status_time = 0.0
 
@@ -99,17 +130,9 @@ class BotA:
     def get_live_market(self):
         """
         REST-selects the currently open KXBTC15M market (earliest close_time) and
-        returns (ticker, window_start_timestamp).
-
-        The V2 "ticker" websocket channel is a firehose across every market on the
-        exchange unless scoped with market_tickers -- so the bot needs to know
-        exactly which single ticker to subscribe to before it connects.
-
-        window_start_timestamp comes from the market's REST "open_time" field
-        (authoritative, real UTC), not from parsing the ticker string -- the
-        HHMM embedded in the ticker (e.g. ...26AUG011830-30) turned out to be
-        US Eastern local time, not UTC, which silently threw window-elapsed
-        math off by 4-5 hours.
+        returns (ticker, window_start_timestamp, strike). window_start_timestamp
+        comes from the REST "open_time" field (authoritative UTC) -- see
+        flipper_variant_a.py for why parsing it out of the ticker string is wrong.
         """
         sign_path = "/trade-api/v2/markets"
         query = "?limit=5&status=open&series_ticker=KXBTC15M"
@@ -124,9 +147,18 @@ class BotA:
             markets.sort(key=lambda m: m.get("close_time", ""))
             market = markets[0]
             open_time = datetime.strptime(market["open_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            return market["ticker"], open_time.timestamp()
+            return market["ticker"], open_time.timestamp(), extract_strike_price(market)
         except (requests.RequestException, KeyError, ValueError):
             return None
+
+    def price_n_seconds_ago(self, n):
+        """Earliest sampled price at least n seconds old -- None if not enough history yet."""
+        cutoff = time.time() - n
+        for ts, price in self.price_history:
+            if ts <= cutoff:
+                continue
+            return price
+        return None
 
     def is_blackout_window(self):
         now = datetime.now(timezone.utc).time()
@@ -141,15 +173,20 @@ class BotA:
             return True
         return False
 
-    def is_trading_allowed(self):
+    def is_trading_allowed(self, strike_price):
         if self.is_blackout_window():
+            return False
+        if strike_price == 0.0 or strike_price is None:
             return False
         if time.time() - self.last_reconnect_time < RECONNECT_COOLDOWN_SECONDS:
             return False
         return True
 
     async def run(self):
-        startup_msg = f"ENGINE STARTED [{self.bot_name}] | Trigger: ${MOVE_THRESHOLD} Move"
+        startup_msg = (
+            f"ENGINE STARTED [{self.bot_name}] | 60s Move: ${MOVE_THRESHOLD_60S} | "
+            f"180s Move: ${MOVE_THRESHOLD_180S} | Target: +{PROFIT_TARGET_CENTS}c | Stop: -{STOP_LOSS_CENTS}c"
+        )
         print(f"[INFO] {startup_msg}")
         self.write_audit_log(startup_msg)
 
@@ -159,26 +196,23 @@ class BotA:
                 if not live_market:
                     await asyncio.sleep(2)
                     continue
-                target_ticker, target_start_timestamp = live_market
+                target_ticker, target_start_timestamp, target_strike = live_market
 
-                # Right at a window boundary, Kalshi's REST listing can briefly
-                # still report the just-closed market as "open" before the next
-                # one appears. Locking onto an already-expired market means no
-                # more ticks will ever arrive for it -- the bot would just hang.
+                # Right at a window boundary, REST can briefly still report the
+                # just-closed market as "open" -- locking onto it means no more
+                # ticks will ever arrive for it, and the bot would just hang.
                 if time.time() - target_start_timestamp >= 900:
                     await asyncio.sleep(2)
                     continue
 
-                # Only reset window state if this is genuinely a new window --
-                # a reconnect mid-window (e.g. after a dropped connection) should
-                # resume the same anchor/trade count, not hand out a free re-entry.
                 is_new_window = target_ticker != self.current_window_id
                 if is_new_window:
                     self.current_window_id = target_ticker
                     self.window_start_timestamp = target_start_timestamp
+                    self.current_strike = target_strike
                     self.trade_count = 0
-                    self.brti_anchor_price = 0.0
                     self.active_position = None
+                    self.price_history.clear()
 
                 self.last_reconnect_time = time.time()
                 ws_headers = self.sign("GET", "/trade-api/ws/v2")
@@ -186,9 +220,6 @@ class BotA:
                 async with websockets.connect(KALSHI_WS_URL, ping_interval=None, additional_headers=ws_headers) as ws:
                     print(f"[INFO] {self.bot_name} connected to WebSocket. Locked onto window {target_ticker}.")
 
-                    # Scope the ticker channel to this one market -- an unscoped
-                    # subscription streams ticks for every market on the exchange
-                    # and effectively never surfaces KXBTC15M updates in practice.
                     subscribe_ticker_msg = {
                         "id": 1,
                         "cmd": "subscribe",
@@ -225,15 +256,12 @@ class BotA:
                                 raw_data_str = msg_obj.get("data", "{}")
                                 parsed_index_data = json.loads(raw_data_str)
                                 self.current_brti = float(parsed_index_data.get("value", 0.0))
-
-                                if self.brti_anchor_price == 0.0 and self.current_brti > 0:
-                                    self.brti_anchor_price = self.current_brti
-                                    if self.trade_count == 0:
-                                        open_msg = f"📍 NEW WINDOW: {self.current_window_id} | INITIAL BRTI ANCHOR: ${self.brti_anchor_price:,.2f}"
-                                    else:
-                                        open_msg = f"🔄 RE-ARMED: {self.current_window_id} | NEW ANCHOR: ${self.brti_anchor_price:,.2f} | Trades So Far: {self.trade_count}"
-                                    print(f"\n[INFO] {open_msg}")
-                                    self.write_audit_log(open_msg)
+                                if self.current_brti > 0:
+                                    now_t = time.time()
+                                    self.price_history.append((now_t, self.current_brti))
+                                    prune_before = now_t - CONFIRMATION_LOOKBACK_SECONDS - 5
+                                    while self.price_history and self.price_history[0][0] < prune_before:
+                                        self.price_history.popleft()
                             except (json.JSONDecodeError, ValueError, TypeError):
                                 pass
 
@@ -254,21 +282,24 @@ class BotA:
 
                             # Heartbeat status update (every 15 seconds)
                             if time.time() - self.last_status_time >= STATUS_UPDATE_INTERVAL:
-                                if elapsed_time <= ENTRY_PHASE_SECONDS and self.trade_count < MAX_TRADES_PER_WINDOW:
-                                    time_left = int(ENTRY_PHASE_SECONDS - elapsed_time)
-                                    current_delta = self.current_brti - self.brti_anchor_price
-                                    print(f"[STATUS] ⏳ Entry Phase Active | BTC: ${self.current_brti:,.2f} | Delta: ${current_delta:+.2f} | Entry Time Left: {time_left}s | Trades: {self.trade_count}/{MAX_TRADES_PER_WINDOW}")
-                                elif elapsed_time > ENTRY_PHASE_SECONDS:
-                                    print(f"[STATUS] 💤 Entry Phase Closed (Watching Market) | BTC: ${self.current_brti:,.2f}")
+                                p60 = self.price_n_seconds_ago(60)
+                                p180 = self.price_n_seconds_ago(180)
+                                d60 = (self.current_brti - p60) if p60 else 0.0
+                                d180 = (self.current_brti - p180) if p180 else 0.0
+                                if self.active_position:
+                                    print(f"[STATUS] 📈 Holding {self.active_position} | BTC: ${self.current_brti:,.2f} | Elapsed: {int(elapsed_time)}s")
+                                elif elapsed_time <= ENTRY_CUTOFF_SECONDS and self.trade_count < MAX_TRADES_PER_WINDOW:
+                                    print(f"[STATUS] ⏳ Watching | BTC: ${self.current_brti:,.2f} | 60s Δ: ${d60:+.2f} | 180s Δ: ${d180:+.2f} | Entry Time Left: {int(ENTRY_CUTOFF_SECONDS - elapsed_time)}s")
+                                else:
+                                    print(f"[STATUS] 💤 Entry Window Closed (Watching Market) | BTC: ${self.current_brti:,.2f}")
                                 self.last_status_time = time.time()
 
-                            # Forced exit once the entry phase closes, so a stalled
-                            # position doesn't ride out the rest of the 15m window.
-                            if elapsed_time >= ENTRY_PHASE_SECONDS and self.active_position:
+                            # Hard pre-settlement cutoff -- force-close regardless of P/L.
+                            if elapsed_time >= FORCE_EXIT_SECONDS and self.active_position:
                                 side = self.active_position
                                 bid = yes_bid if side == "YES" else no_bid
                                 pl = bid - self.entry_price
-                                exit_msg = f"⏱️ ENTRY PHASE CUTOFF ({ENTRY_PHASE_SECONDS}s): Forced exit {side} @ {bid}c (P/L: {pl:+d}c)"
+                                exit_msg = f"⏱️ FORCE EXIT ({FORCE_EXIT_SECONDS}s pre-settlement): Sold {side} @ {bid}c (P/L: {pl:+d}c)"
                                 print(f"[INFO] {exit_msg}")
                                 self.write_audit_log(exit_msg)
                                 self.active_position = None
@@ -280,54 +311,60 @@ class BotA:
                                 self.write_audit_log(close_msg)
                                 break
 
-                            # 3. Trigger Calculation
-                            if (self.brti_anchor_price > 0 and self.active_position is None
-                                    and elapsed_time < ENTRY_PHASE_SECONDS and self.trade_count < MAX_TRADES_PER_WINDOW):
-                                delta = self.current_brti - self.brti_anchor_price
+                            # 3. Trigger Calculation -- 60s AND 180s deltas must agree in
+                            # direction and both clear their threshold. A spike that only
+                            # clears the 60s bar (no follow-through) is filtered out here.
+                            if (self.active_position is None and elapsed_time < ENTRY_CUTOFF_SECONDS
+                                    and self.trade_count < MAX_TRADES_PER_WINDOW):
+                                p60 = self.price_n_seconds_ago(60)
+                                p180 = self.price_n_seconds_ago(180)
 
-                                if abs(delta) >= MOVE_THRESHOLD and self.is_trading_allowed():
+                                if p60 is not None and p180 is not None:
+                                    delta_60 = self.current_brti - p60
+                                    delta_180 = self.current_brti - p180
+                                    confirmed_up = delta_60 >= MOVE_THRESHOLD_60S and delta_180 >= MOVE_THRESHOLD_180S
+                                    confirmed_down = delta_60 <= -MOVE_THRESHOLD_60S and delta_180 <= -MOVE_THRESHOLD_180S
 
-                                    if delta > 0 and (MIN_ASK_CENTS <= yes_ask <= MAX_ASK_CENTS):
-                                        self.active_position = "YES"
-                                        self.entry_price = yes_ask
-                                        self.target_sell = yes_ask + PROFIT_TARGET_CENTS
-                                        self.stop_price = max(1, yes_ask - STOP_LOSS_CENTS)
-                                        self.position_start_time = time.time()
-                                        self.trade_count += 1
+                                    if (confirmed_up or confirmed_down) and self.is_trading_allowed(self.current_strike):
 
-                                        trade_msg = (
-                                            f"🎯 ENTRY #{self.trade_count}: Bought YES @ {yes_ask}c | BTC Delta: $+{delta:.2f} | "
-                                            f"Target: {self.target_sell}c | Stop: {self.stop_price}c"
-                                        )
-                                        print(f"[INFO] {trade_msg}")
-                                        self.write_audit_log(trade_msg)
+                                        if confirmed_up and (MIN_ASK_CENTS <= yes_ask <= MAX_ASK_CENTS):
+                                            self.active_position = "YES"
+                                            self.entry_price = yes_ask
+                                            self.target_sell = yes_ask + PROFIT_TARGET_CENTS
+                                            self.stop_price = max(1, yes_ask - STOP_LOSS_CENTS)
+                                            self.position_start_time = time.time()
+                                            self.trade_count += 1
 
-                                    elif delta < 0 and (MIN_ASK_CENTS <= no_ask <= MAX_ASK_CENTS):
-                                        self.active_position = "NO"
-                                        self.entry_price = no_ask
-                                        self.target_sell = no_ask + PROFIT_TARGET_CENTS
-                                        self.stop_price = max(1, no_ask - STOP_LOSS_CENTS)
-                                        self.position_start_time = time.time()
-                                        self.trade_count += 1
+                                            trade_msg = (
+                                                f"🎯 ENTRY #{self.trade_count}: Bought YES @ {yes_ask}c | "
+                                                f"60s Δ: $+{delta_60:.2f} | 180s Δ: $+{delta_180:.2f} | "
+                                                f"Target: {self.target_sell}c | Stop: {self.stop_price}c"
+                                            )
+                                            print(f"[INFO] {trade_msg}")
+                                            self.write_audit_log(trade_msg)
 
-                                        trade_msg = (
-                                            f"🎯 ENTRY #{self.trade_count}: Bought NO @ {no_ask}c | BTC Delta: ${delta:.2f} | "
-                                            f"Target: {self.target_sell}c | Stop: {self.stop_price}c"
-                                        )
-                                        print(f"[INFO] {trade_msg}")
-                                        self.write_audit_log(trade_msg)
+                                        elif confirmed_down and (MIN_ASK_CENTS <= no_ask <= MAX_ASK_CENTS):
+                                            self.active_position = "NO"
+                                            self.entry_price = no_ask
+                                            self.target_sell = no_ask + PROFIT_TARGET_CENTS
+                                            self.stop_price = max(1, no_ask - STOP_LOSS_CENTS)
+                                            self.position_start_time = time.time()
+                                            self.trade_count += 1
 
-                                    # Re-arm: next tick's BRTI value becomes the fresh
-                                    # anchor so the bot can catch the next swing from
-                                    # here, instead of needing an even bigger
-                                    # cumulative move from the original window-open price.
-                                    self.brti_anchor_price = 0.0
+                                            trade_msg = (
+                                                f"🎯 ENTRY #{self.trade_count}: Bought NO @ {no_ask}c | "
+                                                f"60s Δ: ${delta_60:.2f} | 180s Δ: ${delta_180:.2f} | "
+                                                f"Target: {self.target_sell}c | Stop: {self.stop_price}c"
+                                            )
+                                            print(f"[INFO] {trade_msg}")
+                                            self.write_audit_log(trade_msg)
 
-                            # 4. Position management: take profit / stop loss / hold expiration
+                            # 4. Position management -- target / stop only. No short fixed
+                            # hold: the whole point is to let a confirmed move develop,
+                            # up to the hard FORCE_EXIT_SECONDS cutoff above.
                             if self.active_position:
                                 side = self.active_position
                                 bid = yes_bid if side == "YES" else no_bid
-                                hold_time = time.time() - self.position_start_time
 
                                 if bid >= self.target_sell:
                                     pl = bid - self.entry_price
@@ -335,7 +372,6 @@ class BotA:
                                     print(f"[INFO] {exit_msg}")
                                     self.write_audit_log(exit_msg)
                                     self.active_position = None
-                                    self.brti_anchor_price = 0.0
 
                                 elif bid <= self.stop_price and bid > 0:
                                     pl = bid - self.entry_price
@@ -343,15 +379,6 @@ class BotA:
                                     print(f"[INFO] {exit_msg}")
                                     self.write_audit_log(exit_msg)
                                     self.active_position = None
-                                    self.brti_anchor_price = 0.0
-
-                                elif hold_time >= HOLD_EXPIRATION_SECONDS:
-                                    pl = bid - self.entry_price
-                                    exit_msg = f"⏱️ HOLD EXPIRED ({HOLD_EXPIRATION_SECONDS}s): Closed {side} @ {bid}c (P/L: {pl:+d}c)"
-                                    print(f"[INFO] {exit_msg}")
-                                    self.write_audit_log(exit_msg)
-                                    self.active_position = None
-                                    self.brti_anchor_price = 0.0
 
             except Exception as e:
                 err_msg = f"Exception: {e}. Reconnecting in 5s..."
@@ -360,5 +387,5 @@ class BotA:
                 await asyncio.sleep(5)
 
 if __name__ == "__main__":
-    bot = BotA()
+    bot = BotD()
     asyncio.run(bot.run())
