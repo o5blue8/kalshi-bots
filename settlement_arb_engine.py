@@ -51,7 +51,13 @@ def extract_strike_price(market_obj):
     strike = market_obj.get("floor_strike") or market_obj.get("cap_strike")
     if strike and float(strike) > 0:
         return float(strike)
-    text = f"{market_obj.get('title', '')} {market_obj.get('subtitle', '')}"
+    # Fallback when floor_strike/cap_strike are missing (seen transiently on a
+    # freshly-listed market). The dollar amount reliably appears in
+    # yes_sub_title ("Target Price: $77,249.55"); title carries no number and
+    # subtitle is often None -- so search yes_sub_title first, and guard against
+    # None values (get(key, "") still returns None when the key exists as None).
+    text = " ".join(str(market_obj.get(f) or "")
+                    for f in ("yes_sub_title", "title", "subtitle"))
     matches = re.findall(r"\$?([0-9]{2,3},?[0-9]{3}\.?[0-9]*)", text)
     if matches:
         try:
@@ -103,7 +109,15 @@ class SettlementMonitor:
             markets.sort(key=lambda m: m.get("close_time", ""))
             m = markets[0]
             close_dt = datetime.strptime(m["close_time"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
-            return m["ticker"], close_dt.timestamp(), extract_strike_price(m)
+            strike = extract_strike_price(m)
+            if strike <= 0:
+                # Couldn't determine the strike (transient on a freshly-listed
+                # market). Skip rather than lock onto a window we can't price:
+                # the strike is latched once per window (see run()), so a bad
+                # read here would force winner=YES on every observation for the
+                # next 15 minutes. The caller retries on the next poll.
+                return None
+            return m["ticker"], close_dt.timestamp(), strike
         except (requests.RequestException, KeyError, ValueError):
             return None
 
@@ -192,7 +206,7 @@ class SettlementMonitor:
 
                         # --- record an observation as we cross each checkpoint ---
                         for cp in CHECKPOINTS_SEC:
-                            if cp not in self.logged_checkpoints and ttc <= cp and self.avg_60s > 0:
+                            if cp not in self.logged_checkpoints and ttc <= cp and self.avg_60s > 0 and self.strike > 0:
                                 self.logged_checkpoints.add(cp)
                                 margin = self.avg_60s - self.strike
                                 winner = "YES" if margin > 0 else "NO"
